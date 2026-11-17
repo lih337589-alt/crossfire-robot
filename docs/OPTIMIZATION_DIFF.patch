@@ -1,0 +1,1096 @@
+--- a/Makefile
++++ b/Makefile
+@@ -17,7 +17,7 @@
+ CPP_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CPP_SRCS))
+ C_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SRCS))
+ 
+-.PHONY: all clean test run check-opencv
++.PHONY: all clean test run check-opencv bench-vision
+ all: check-opencv demo_new
+ 
+ check-opencv:
+@@ -34,6 +34,11 @@
+ demo_new: $(CPP_OBJS) $(C_OBJS)
+ 	$(CXX) $(CXXFLAGS) $^ -o $@ $(OPENCV_LIBS) -pthread -lstdc++fs
+ 
++bench-vision: check-opencv
++	@mkdir -p $(BUILD_DIR)
++	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(OPENCV_CFLAGS) tests/vision_benchmark.cpp config/config.cpp perception/vision_pipeline.cpp perception/cone_detect.cpp perception/cone_logic.cpp -o $(BUILD_DIR)/vision_benchmark $(OPENCV_LIBS)
++	./$(BUILD_DIR)/vision_benchmark config/config.ini
++
+ test:
+ 	./run_tests.sh
+ 
+--- a/README.md
++++ b/README.md
+@@ -33,6 +33,14 @@
+ # 或 ./run_tests.sh
+ ```
+ 
++在安装了真实 OpenCV4 的开发板上测量合成视觉管线的耗时分布：
++
++```bash
++make bench-vision
++```
++
++该基准包含 HSV 分割、形态学处理、红蓝锥桶轮廓检测和可复用分行；它是同机对比优化前后版本的基线工具，不代表实车识别准确率，也不能替代相机采集到 PWM 输出的端到端延迟测试。
++
+ `tests/stub/opencv2/opencv.hpp` 是**测试专用语法桩**，不能用于生产链接；生产构建必须安装真正的 OpenCV4。
+ 
+ ## 比赛流程与保护
+@@ -68,3 +76,12 @@
+ - 雷达、编码器、GPS 和语音识别未伪装成已集成设备：当前清单未提供相应协议/SDK，见 `docs/HARDWARE_MATCH.md` 的实车核对边界。
+ 
+ 详细说明见 [`docs/HARDWARE_MATCH.md`](docs/HARDWARE_MATCH.md)。
++
++## 本轮增量性能优化
++
++- `ConeDetector` 缓存每个轮廓的面积，单帧每个轮廓只调用一次 `contourArea()`；对输入图像格式和面积参数做防御性检查。
++- 新增 `ConeRowGrouper`，在实时路径中复用指针排序和每排容量，避免每帧复制完整 `Cone` 对象/字符串。
++- `MissionController::process_crossing()` 流式选缝，不再为每排分配临时 `vector<Gap>`；候选缝策略仍是“中心距离最近、平局选更宽”。
++- 阻挡区间和中心距离使用 64 位中间值，避免极端整数输入的有符号溢出。
++- 配置校验拒绝非法 HSV 区间、重叠红色 H 区间以及小于 3000ms 的据点停留配置。
++- `make bench-vision` 可在 OpenCV4 环境中测量合成工作负载的 mean/p50/p95/max；本次未在当前环境编造或报告耗时数据。
+--- a/app/mission_controller.cpp
++++ b/app/mission_controller.cpp
+@@ -7,7 +7,8 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <limits>
+-#include <numeric>
++#include <cstdint>
++#include <climits>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -186,7 +187,9 @@
+         if (capture_frame_.cols == cfg_.cam_w && capture_frame_.rows == cfg_.cam_h) {
+             frame_ = capture_frame_; // shallow Mat header copy; no pixel copy
+         } else {
+-            cv::resize(capture_frame_, frame_, cv::Size(cfg_.cam_w, cfg_.cam_h), 0.0, 0.0, cv::INTER_AREA);
++            const bool downscale = capture_frame_.cols >= cfg_.cam_w && capture_frame_.rows >= cfg_.cam_h;
++            const int interpolation = downscale ? cv::INTER_AREA : cv::INTER_LINEAR;
++            cv::resize(capture_frame_, frame_, cv::Size(cfg_.cam_w, cfg_.cam_h), 0.0, 0.0, interpolation);
+         }
+         camera_misses_ = 0;
+         camera_reopen_count_ = 0;
+@@ -240,14 +243,20 @@
+ }
+ 
+ bool MissionController::check_red_hit(const std::vector<Cone>& reds) const {
++    const int64_t center = cfg_.img_center();
+     for (const auto& r : reds) {
+-        if (r.bottom_y >= cfg_.red_hit_y && std::abs(r.bottom_x - cfg_.img_center()) <= cfg_.red_hit_dx) return true;
++        const int64_t dx = static_cast<int64_t>(r.bottom_x) - center;
++        const int64_t abs_dx = dx < 0 ? -dx : dx;
++        if (r.bottom_y >= cfg_.red_hit_y && abs_dx <= cfg_.red_hit_dx) return true;
+     }
+     return false;
+ }
+ bool MissionController::check_blue_hit(const std::vector<Cone>& blues) const {
++    const int64_t center = cfg_.img_center();
+     for (const auto& b : blues) {
+-        if (b.bottom_y >= cfg_.blue_hit_y && std::abs(b.bottom_x - cfg_.img_center()) <= cfg_.blue_hit_dx) return true;
++        const int64_t dx = static_cast<int64_t>(b.bottom_x) - center;
++        const int64_t abs_dx = dx < 0 ? -dx : dx;
++        if (b.bottom_y >= cfg_.blue_hit_y && abs_dx <= cfg_.blue_hit_dx) return true;
+     }
+     return false;
+ }
+@@ -331,22 +340,45 @@
+         drive_.command(cfg_.speed_approach, a.single_servo);
+         return;
+     }
+-    const auto rows = group_rows(blues, cfg_.row_tolerance);
++    const size_t row_count = row_grouper_.group(blues, cfg_.row_tolerance);
+     int target_x = -1;
+-    for (const auto& row : rows) {
++    const int image_center = cfg_.img_center();
++    for (size_t row_index = 0; row_index < row_count; ++row_index) {
++        const auto& row = row_grouper_.row(row_index);
+         if (row.size() < 2) continue;
+-        const int row_y = static_cast<int>(std::accumulate(row.begin(), row.end(), int64_t{0},
+-            [](int64_t sum, const Cone& c) { return sum + c.bottom_y; }) / static_cast<int64_t>(row.size()));
+-        std::vector<Gap> gaps;
+-        gaps.reserve(row.size() - 1);
++
++        int64_t y_sum = 0;
++        for (const Cone* cone : row) y_sum += cone->bottom_y;
++        const int row_y = static_cast<int>(y_sum / static_cast<int64_t>(row.size()));
++
++        // Stream candidates instead of allocating a temporary vector<Gap> on every row/frame.
++        // Tie-breaking matches choose_gap_center(..., "center"): nearest image center, then wider gap.
++        int row_target_x = -1;
++        int row_best_width = -1;
++        int64_t row_best_distance = INT64_MAX;
+         for (size_t i = 0; i + 1 < row.size(); ++i) {
+-            const int left_x = row[i].bottom_x, right_x = row[i + 1].bottom_x;
+-            const int width = right_x - left_x;
+-            if (width < cfg_.min_gap_width || width > cfg_.max_gap_width) continue;
+-            if (!corridor_has_red_blocker(reds, left_x, right_x, row_y, cfg_.red_corridor_margin, cfg_.red_block_below))
+-                gaps.push_back({(left_x + right_x) / 2, width});
++            const int left_x = row[i]->bottom_x;
++            const int right_x = row[i + 1]->bottom_x;
++            const int64_t width64 = static_cast<int64_t>(right_x) - left_x;
++            if (width64 < cfg_.min_gap_width || width64 > cfg_.max_gap_width) continue;
++            if (corridor_has_red_blocker(reds, left_x, right_x, row_y,
++                                         cfg_.red_corridor_margin, cfg_.red_block_below)) continue;
++
++            const int width = static_cast<int>(width64);
++            const int center_x = static_cast<int>((static_cast<int64_t>(left_x) + right_x) / 2);
++            const int64_t delta = static_cast<int64_t>(center_x) - image_center;
++            const int64_t distance = delta < 0 ? -delta : delta;
++            if (distance < row_best_distance ||
++                (distance == row_best_distance && width > row_best_width)) {
++                row_target_x = center_x;
++                row_best_width = width;
++                row_best_distance = distance;
++            }
++        }
++        if (row_target_x >= 0) {
++            target_x = row_target_x;
++            break;
+         }
+-        if (!gaps.empty()) { target_x = choose_gap_center(gaps, cfg_.img_center(), "center"); break; }
+     }
+     if (target_x < 0) {
+         drive_.command(cfg_.speed_approach, a.no_safe_servo);
+@@ -378,7 +410,9 @@
+         ? cfg_.speed_approach : cfg_.speed_run;
+     drive_.command(motor, steer);
+ 
+-    const bool centered = std::abs(camp.center_x - cfg_.img_center()) <= cfg_.stop_center_tol;
++    const int64_t center_error = static_cast<int64_t>(camp.center_x) - cfg_.img_center();
++    const int64_t abs_center_error = center_error < 0 ? -center_error : center_error;
++    const bool centered = abs_center_error <= cfg_.stop_center_tol;
+     const bool close_enough_to_bypass_center = camp.ratio >= cfg_.stop_area_ratio * cfg_.camp_center_bypass_factor;
+     if ((centered || close_enough_to_bypass_center) && camp.ratio >= cfg_.stop_area_ratio) ++stop_frames_;
+     else stop_frames_ = 0;
+--- a/app/mission_controller.h
++++ b/app/mission_controller.h
+@@ -63,6 +63,7 @@
+     VisionPipeline vision_;
+     ConeDetector blue_detector_;
+     ConeDetector red_detector_;
++    ConeRowGrouper row_grouper_; // persistent workspace avoids per-frame row/vector allocation
+     CampDetector camp_detector_;
+     PID_t pid_{};
+     cv::Mat capture_frame_; // native UVC frame; only resized if driver ignores requested mode
+--- a/config/config.cpp
++++ b/config/config.cpp
+@@ -191,7 +191,19 @@
+     auto fail = [&](const char* msg) { if (reason) *reason = msg; return false; };
+     if (field_length_m < 6.0f || field_length_m > 8.0f || field_width_m < 3.0f || field_width_m > 5.0f) return fail("场地尺寸必须在 6~8m × 3~5m 范围内");
+     if (mode != "race" && mode != "debug" && mode != "bench") return fail("MODE 仅允许 race/debug/bench");
++    if (cam_w <= 0 || cam_h <= 0 || cam_fps <= 0) return fail("摄像头分辨率和帧率必须为正数");
+     if (pixel_ref_w <= 0 || pixel_ref_h <= 0) return fail("PIXEL_REF_W/H 必须大于 0");
++    const auto valid_hue = [](const ColorThreshold& c) {
++        return c.h_low >= 0 && c.h_high <= 180 && c.h_low <= c.h_high &&
++               c.s_low >= 0 && c.s_low <= 255 && c.v_low >= 0 && c.v_low <= 255;
++    };
++    if (!valid_hue(blue) || !valid_hue(red1) || !valid_hue(red2))
++        return fail("HSV 色相/饱和度/亮度阈值范围非法");
++    const bool red_hue_overlap = std::max(red1.h_low, red2.h_low) <= std::min(red1.h_high, red2.h_high);
++    if (red_hue_overlap) return fail("RED1 与 RED2 色相区间必须不重叠，避免红色占比重复计数");
++    if (color_card_threshold <= 0.0f || color_card_threshold > 1.0f || color_stable_frames < 1)
++        return fail("色卡占比阈值必须在 (0,1]，稳定帧数必须至少为 1");
++    if (station_stay_ms < 3000) return fail("STATION_STAY_MS 不得少于 3000ms");
+     if (roi_x1 < 0 || roi_y1 < 0 || roi_x2 <= roi_x1 || roi_y2 <= roi_y1 || roi_x2 > cam_w || roi_y2 > cam_h)
+         return fail("缩放后的 ROI 必须为正面积且完全位于摄像头分辨率内");
+     if (servo_left < servo_right) return fail("SERVO_LEFT 应大于等于 SERVO_RIGHT");
+--- a/docs/FINAL_DELIVERY.md
++++ b/docs/FINAL_DELIVERY.md
+@@ -210,3 +210,12 @@
+ 6. 断开摄像头、IMU，拔掉语音播放器/关闭 TTS，验证车辆按预期停下或降级。
+ 7. 核对底盘“阿克曼结构/四轮差速驱动”的资料表述与实际接线；确认 ESC 刹车模式、IMU 串口协议、编码器接口，以及清单中的 LS01X/GPS 是否已安装。不要对没有协议/驱动的设备虚构数据读取能力。
+ 8. 实测整条路线计时、停车误差、CPU、帧延迟和日志文件；将结果记录为实测值，不把理论预估写成测量数据。
++
++
++## 增量极限优化记录
++
++本轮在现有结构上增加了可复用 `ConeRowGrouper`，实时路径只保存锥桶指针而不是复制 `Cone`（其中包含 `std::string`）；热身后、输入锥桶数量不超过历史峰值时，排序/分行工作区可复用已有容量。选缝过程直接流式维护“中心距离最小、同距宽度最大”的候选，不再构造每排的临时 `vector<Gap>`。
++
++`ConeDetector` 新增复用的 `contour_areas_`，每个轮廓每帧仅计算一次面积；填充率分母采用 `double(w) * double(h)`，底部点 x 求和采用 64 位。输入不是非空 8-bit 单通道掩膜、面积参数非有限或为负时，检测器返回空结果而不是调用 OpenCV 触发断言。
++
++配置校验额外拒绝无效 HSV 范围、两个红色 H 区间重叠，以及据点停留小于 3000ms。新增 `tests/vision_benchmark.cpp`，在真实 OpenCV4 环境使用 `make bench-vision` 输出合成视觉管线 mean/p50/p95/max 延迟。当前运行环境未安装 OpenCV4，因此这里不声称该基准已运行，也不报告未经测量的加速百分比。
+--- a/docs/OPTIMIZATION_REPORT.md
++++ b/docs/OPTIMIZATION_REPORT.md
+@@ -0,0 +1,144 @@
++# 穿越火线 C++/OpenCV 增量极限优化报告
++
++## 范围与约束
++
++- 基线：用户上传的 `根据硬件改的.zip`，保留原有 C++17/OpenCV4 架构、业务流程和主要公开函数签名。
++- 本轮只修改热点路径、边界校验、测试和基准入口；没有引入 YOLO、ROS、第三方图像库或新的硬件 API。
++- 本次环境没有安装 OpenCV4，因此真实视觉运行与生产二进制构建尚未验证。`run_tests.sh` 中的 OpenCV shim 只做语法/接口检查，不是 OpenCV 的替代实现。
++
++## 优化 1：轮廓面积只计算一次
++
++**文件：** `perception/cone_detect.h`、`perception/cone_detect.cpp`
++
++**问题：** 旧实现先遍历所有轮廓计算 `max_blob`，后续过滤循环又对每个轮廓调用 `cv::contourArea()`。每帧 C 个轮廓时，面积函数最多被调用约 2C 次。
++
++**实现：** 新增成员 `std::vector<double> contour_areas_`，清空但保留容量；第一次遍历时保存每个轮廓面积并求最大值，第二遍直接读取缓存。检测入口拒绝空掩膜、非单通道/非 8-bit 掩膜、负面积和非有限面积参数。填充率分母用 `double(w) * double(h)`，底部 x 均值用 64 位累加；底部最大 y 直接复用 `boundingRect` 的 `y + h - 1`，不再为每个轮廓额外扫描一次求最大 y。
++
++```cpp
++contour_areas_.clear();
++if (contour_areas_.capacity() < contours_.size())
++    contour_areas_.reserve(contours_.size());
++double max_blob = 0.0;
++for (const auto& contour : contours_) {
++    const double area = contour.empty() ? 0.0 : cv::contourArea(contour);
++    contour_areas_.push_back(area);
++    max_blob = std::max(max_blob, area);
++}
++// 后续过滤循环使用 contour_areas_[i]，不再重复调用 contourArea。
++```
++
++**复杂度：** 若所有轮廓点总数为 P，轮廓面积计算从约 O(P) 的两遍遍历降为一遍 O(P)，并消除每个有效轮廓额外的一次 max-y 点遍历；过滤与形状检测复杂度不变。缓存额外空间 O(C) 个 double，容量增长后跨帧复用。
++
++**收益：** 每帧 `contourArea()` 调用数从最多约 2C 次降到 C 次；每个通过前置过滤的轮廓少一次 max-y 点扫描。不承诺固定的毫秒/百分比提升。
++
++**风险：** 新输入格式检查会将错误的 3 通道/非 8-bit 掩膜视为无检测结果，而不是让 OpenCV 断言中断主循环。真实相机输出仍应确保掩膜为 8-bit 单通道。
++
++## 优化 2：可复用锥桶分行工作区
++
++**文件：** `perception/cone_logic.h`、`perception/cone_logic.cpp`、`app/mission_controller.h`、`app/mission_controller.cpp`
++
++**问题：** 旧实时路径每帧调用 `group_rows()`，复制一份 `std::vector<Cone>` 排序，再把每个 `Cone` 复制到分组桶。`Cone` 含 `std::string`；即使短字符串通常使用 SSO，也会产生额外对象复制。嵌套 vector 在行数/锥桶数变化时还可能反复分配。
++
++**实现：** 新增 `ConeRowGrouper`，内部用 `const Cone*` 排序、分组；每排桶保留高水位容量。`MissionController` 持有一个长期实例并在每帧复用。原有 `group_rows(const std::vector<Cone>&, int)` 签名保留，作为兼容包装器；测试和非实时调用可继续使用。
++
++```cpp
++const size_t row_count = row_grouper_.group(blues, cfg_.row_tolerance);
++for (size_t row_index = 0; row_index < row_count; ++row_index) {
++    const auto& row = row_grouper_.row(row_index); // vector<const Cone*>
++    // 读取 row[i]->bottom_x / row[i]->bottom_y，不复制 Cone。
++}
++```
++
++**复杂度：** 保持 O(N² + N log N) 的分组/排序策略，避免改变原有“按 y 排序、选最近行均值、排按 mean_y 排序”的行为语义。实时路径中的 `Cone` 对象复制从约 2N 次降到 0 次；保存 N 个指针，空间 O(N)。当本帧锥桶/行数不超过工作区历史峰值时，分组器的排序和分组容器可复用已有容量。
++
++**风险：** 分组器保存的是输入 vector 的指针，指针仅在输入容器未修改且下一次 `group()` 尚未调用时有效。实时控制器在同一帧中先检测、再分组、再消费，不跨帧保存这些指针。原有 `group_rows()` 兼容包装器仍会按返回值语义分配并复制输出；实时路径已切换到新接口。
++
++## 优化 3：候选缝流式选择，去掉每排临时 vector
++
++**文件：** `app/mission_controller.cpp` 的 `MissionController::process_crossing()`
++
++**问题：** 旧代码为每个候选锥桶行创建 `std::vector<Gap>`，收集合法缝后再调用 `choose_gap_center()`。该容器在控制循环中重复构造/分配。
++
++**实现：** 一边检查相邻蓝锥的间距与红锥阻挡，一边维护当前排最优候选：离画面中心最近；距离相同时选择更宽的缝。遇到第一排存在合法缝后立即结束扫描，和原 `choose_gap_center(..., "center")` 的策略一致。
++
++```cpp
++int row_target_x = -1;
++int row_best_width = -1;
++int64_t row_best_distance = INT64_MAX;
++for (size_t i = 0; i + 1 < row.size(); ++i) {
++    const int left_x = row[i]->bottom_x;
++    const int right_x = row[i + 1]->bottom_x;
++    const int64_t width64 = static_cast<int64_t>(right_x) - left_x;
++    if (width64 < cfg_.min_gap_width || width64 > cfg_.max_gap_width) continue;
++    if (corridor_has_red_blocker(reds, left_x, right_x, row_y,
++                                 cfg_.red_corridor_margin, cfg_.red_block_below)) continue;
++    const int width = static_cast<int>(width64);
++    const int center_x = static_cast<int>((static_cast<int64_t>(left_x) + right_x) / 2);
++    const int64_t delta = static_cast<int64_t>(center_x) - image_center;
++    const int64_t distance = delta < 0 ? -delta : delta;
++    if (distance < row_best_distance ||
++        (distance == row_best_distance && width > row_best_width)) {
++        row_target_x = center_x;
++        row_best_width = width;
++        row_best_distance = distance;
++    }
++}
++```
++
++**复杂度：** 每排从“检查相邻锥桶 O(B) + 临时 gaps 容器空间 O(B) + 再扫描候选 O(B)”变成单次 O(B) 扫描、O(1) 附加空间。红锥阻挡检查仍为每个候选缝遍历红锥列表，最坏 O(BR)；本轮没有假称它已变为常数时间。
++
++**风险：** 选择逻辑需要保持平局规则一致。纯逻辑测试及确定性随机参考对照测试覆盖了 `group_rows()` 兼容函数；实际相机下的轨迹仍需在赛道标定。
++
++## 优化 4：极端整数边界安全
++
++**文件：** `perception/cone_logic.cpp`、`app/mission_controller.cpp`
++
++**问题：** 使用 `left_x - margin`、`right_x + margin`、`row_y + below_tol` 或两个 `int` 的直接相减，理论上可能在极端输入下发生有符号溢出；`std::abs(INT_MIN)` 同样有风险。
++
++**实现：** 先将坐标提升为 `int64_t` 再进行边界、差值和绝对距离运算；常规图像坐标的结果不变。
++
++**复杂度：** 时间、空间复杂度不变；新增的是每次比较的 64 位整数运算。风险较低，且覆盖了 `INT_MIN/INT_MAX` 的纯逻辑测试。
++
++## 优化 5：配置与图像入口校验
++
++**文件：** `config/config.cpp`、`perception/vision_pipeline.cpp`、`app/mission_controller.cpp`
++
++**实现：**
++
++- 配置拒绝无效 HSV 上下限、红色两个 H 区间重叠、非正摄像头尺寸/帧率、色卡阈值非法和据点停留低于 3000ms。
++- `VisionPipeline::process()` 在调用 `cvtColor()` 前检查输入是否非空、三通道且为 8-bit。
++- 形态学核尺寸与迭代数在类入口处限幅，防止未经过配置校验的调用传入异常值。
++- 图像缩放时，纯缩小时用 `INTER_AREA`，否则用 `INTER_LINEAR`，避免对放大场景仍使用面积插值。
++- 红/蓝近区和营地中心距离的差值计算改用 64 位中间值。
++
++**复杂度：** 配置校验只发生在加载/初始化阶段。图像格式校验为 O(1)。缩放算法复杂度阶数不变。
++
++**风险：** 分辨率不一致时依旧会把输入 resize 到配置目标尺寸；如果输入与目标宽高比不同，当前代码仍可能产生几何拉伸。赛前应使用相同宽高比的 UVC 模式，或在后续版本中实现带 ROI 映射的等比例裁剪/填充。
++
++## 验证记录
++
++- `./run_tests.sh`：配置 32、状态机 40、HAL 34、锥桶纯逻辑 121、转向 15、Mock 27，共 **269 项断言通过、0 失败**。
++- `tests/test_cone_logic.cpp` 额外使用 AddressSanitizer + UndefinedBehaviorSanitizer 编译运行：121 项通过、0 失败。
++- 全部生产 C++ 源文件及 `tests/vision_synthetic.cpp`、`tests/vision_benchmark.cpp` 通过测试 shim 下的 `-fsyntax-only` 检查；C 驱动通过语法检查。
++- 当前环境没有 OpenCV4，`tests/vision_synthetic.cpp` 的视觉断言没有在真实 OpenCV 下运行；`make clean all` 与 `make bench-vision` 需要在装有 `libopencv-dev` 的目标 Linux 设备上执行。
++
++## 建议的可复现验证命令
++
++```bash
++# 纯逻辑与状态机测试
++./run_tests.sh
++
++# 额外检查溢出/内存错误（在工程根目录执行）
++g++ -std=c++17 -Wall -Wextra -Wpedantic \
++  -fsanitize=address,undefined -fno-omit-frame-pointer \
++  -Iperception tests/test_cone_logic.cpp perception/cone_logic.cpp \
++  -o /tmp/test_cone_logic_san
++/tmp/test_cone_logic_san
++
++# Orange Pi / RK3588：真实 OpenCV 构建
++sudo apt install -y build-essential pkg-config libopencv-dev v4l-utils i2c-tools
++make clean all
++
++# 合成视觉耗时分布；同一台机器对比基线/优化版，不能拿不同硬件的结果直接比较
++make bench-vision
++```
+--- a/perception/cone_detect.cpp
++++ b/perception/cone_detect.cpp
+@@ -2,7 +2,8 @@
+ 
+ #include <algorithm>
+ #include <cmath>
+-#include <numeric>
++#include <cstdint>
++#include <utility>
+ 
+ int ConeDetector::section_width(const cv::Mat& roi, int y_start, int y_end) const {
+     const int y1 = std::max(0, y_start);
+@@ -23,57 +24,108 @@
+ 
+ const std::vector<Cone>& ConeDetector::detect(const cv::Mat& mask, const char* color, float min_area) {
+     cones_.clear();
+-    if (mask.empty()) return cones_;
++    // findContours requires an 8-bit, single-channel image. Reject invalid input instead of
++    // allowing OpenCV to throw from the real-time control loop.
++    if (mask.empty() || mask.channels() != 1 || mask.depth() != CV_8U ||
++        !std::isfinite(min_area) || min_area < 0.0f) {
++        return cones_;
++    }
++
+     cv::findContours(mask, contours_, hierarchy_, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+ 
++    // contourArea() walks contour points. Compute it once and reuse the value in the filtering
++    // pass; the vector retains capacity between frames.
++    contour_areas_.clear();
++    if (contour_areas_.capacity() < contours_.size()) contour_areas_.reserve(contours_.size());
+     double max_blob = 0.0;
+-    for (const auto& contour : contours_) max_blob = std::max(max_blob, cv::contourArea(contour));
+-    const double roi_area = static_cast<double>(p_.roi_w) * p_.roi_h;
+-    if (p_.suppress_large_blob && roi_area > 0.0 && max_blob >= roi_area * p_.stop_area_ratio) return cones_;
+-
+-    cones_.reserve(std::max(cones_.capacity(), contours_.size()));
+     for (const auto& contour : contours_) {
+-        const float area = static_cast<float>(cv::contourArea(contour));
+-        if (area < min_area || contour.empty()) continue;
++        const double area = contour.empty() ? 0.0 : cv::contourArea(contour);
++        contour_areas_.push_back(area);
++        max_blob = std::max(max_blob, area);
++    }
++
++    // The supplied mask is already the ROI. Use its actual dimensions rather than duplicated
++    // configuration metadata so a caller cannot accidentally use a stale ROI size.
++    const double roi_area = static_cast<double>(mask.cols) * static_cast<double>(mask.rows);
++    if (p_.suppress_large_blob && roi_area > 0.0 &&
++        max_blob >= roi_area * std::max(0.0f, p_.stop_area_ratio)) {
++        return cones_;
++    }
++
++    if (cones_.capacity() < contours_.size()) cones_.reserve(contours_.size());
++    for (size_t i = 0; i < contours_.size(); ++i) {
++        const auto& contour = contours_[i];
++        const double contour_area = contour_areas_[i];
++        const float area = static_cast<float>(contour_area); // preserve the original float filter semantics
++        if (contour.empty() || area < min_area) continue;
++
+         const cv::Rect bbox = cv::boundingRect(contour);
+-        const int w = bbox.width, h = bbox.height;
++        const int w = bbox.width;
++        const int h = bbox.height;
+         if (w < p_.min_cont_w || h < p_.min_cont_h) continue;
+-        if (bbox.y + p_.roi_y1 < p_.top_exclude_global_y) continue;
+-        if (bbox.x <= p_.edge_margin_px || bbox.x + w >= mask.cols - p_.edge_margin_px) continue;
++        if (static_cast<int64_t>(bbox.y) + output_offset_y_ < p_.top_exclude_global_y) continue;
++        if (bbox.x <= p_.edge_margin_px ||
++            static_cast<int64_t>(bbox.x) + w >= static_cast<int64_t>(mask.cols) - p_.edge_margin_px) continue;
++
+         const float aspect = static_cast<float>(w) / static_cast<float>(h);
+         if (aspect < p_.aspect_min || aspect > p_.aspect_max) continue;
+-        const float fill = area / static_cast<float>(w * h);
++        const double bbox_area = static_cast<double>(w) * static_cast<double>(h);
++        if (bbox_area <= 0.0) continue;
++        const float fill = area / static_cast<float>(bbox_area);
+         if (fill < p_.fill_min || fill > p_.fill_max) continue;
+ 
+         if (h >= p_.shape_min_height) {
++            // ROI is a Mat header/view; no pixel copy is made here.
+             const cv::Mat roi = mask(bbox);
+             const int top_w = section_width(roi, 0, h / 3);
+             const int mid_w = section_width(roi, h / 3, (2 * h) / 3);
+             const int bot_w = section_width(roi, (2 * h) / 3, h);
+-            if (bot_w < std::max(p_.bottom_min_width, static_cast<int>(top_w * p_.bottom_width_ratio))) continue;
+-            if (mid_w < std::max(p_.mid_min_width, static_cast<int>(top_w * p_.mid_width_ratio))) continue;
++            if (bot_w < std::max(p_.bottom_min_width,
++                                 static_cast<int>(top_w * p_.bottom_width_ratio))) continue;
++            if (mid_w < std::max(p_.mid_min_width,
++                                 static_cast<int>(top_w * p_.mid_width_ratio))) continue;
+         }
+ 
+         const cv::Moments m = cv::moments(contour);
+-        const int cx = m.m00 == 0.0 ? bbox.x + bbox.width / 2 : static_cast<int>(m.m10 / m.m00);
+-        const int cy = m.m00 == 0.0 ? bbox.y + bbox.height / 2 : static_cast<int>(m.m01 / m.m00);
+-        int max_y = -1;
+-        for (const auto& pt : contour) max_y = std::max(max_y, pt.y);
+-        const int band = std::max(p_.bottom_band_min_px, std::min(p_.bottom_band_max_px, h / std::max(1, p_.bottom_band_height_divisor)));
+-        int x_sum = 0, x_count = 0;
++        const int cx = m.m00 == 0.0 ? bbox.x + bbox.width / 2
++                                    : static_cast<int>(m.m10 / m.m00);
++        const int cy = m.m00 == 0.0 ? bbox.y + bbox.height / 2
++                                    : static_cast<int>(m.m01 / m.m00);
++        // boundingRect is inclusive for integer contour points: bottom-most point is y+h-1.
++        // Reuse the already-computed box instead of scanning all contour points again.
++        const int max_y = bbox.y + bbox.height - 1;
++        if (max_y < 0) continue;
++
++        const int divisor = std::max(1, p_.bottom_band_height_divisor);
++        const int band = std::max(p_.bottom_band_min_px,
++                                  std::min(p_.bottom_band_max_px, h / divisor));
++        int64_t x_sum = 0;
++        int64_t x_count = 0;
+         for (const auto& pt : contour) {
+-            if (pt.y >= max_y - band) { x_sum += pt.x; ++x_count; }
++            if (pt.y >= max_y - band) {
++                x_sum += static_cast<int64_t>(pt.x);
++                ++x_count;
++            }
+         }
+         const int bottom_x = x_count == 0 ? bbox.x + bbox.width / 2
+-                                           : static_cast<int>(std::lround(static_cast<double>(x_sum) / x_count));
++            : static_cast<int>(std::lround(static_cast<double>(x_sum) /
++                                           static_cast<double>(x_count)));
++
+         Cone c;
+         c.color = color ? color : "unknown";
+-        c.bbox_x = bbox.x + output_offset_x_; c.bbox_y = bbox.y + output_offset_y_; c.bbox_w = w; c.bbox_h = h;
+-        c.center_x = cx + output_offset_x_; c.center_y = cy + output_offset_y_;
+-        c.bottom_x = bottom_x + output_offset_x_; c.bottom_y = max_y + output_offset_y_; c.area = area;
+-        cones_.push_back(c);
++        c.bbox_x = bbox.x + output_offset_x_;
++        c.bbox_y = bbox.y + output_offset_y_;
++        c.bbox_w = w;
++        c.bbox_h = h;
++        c.center_x = cx + output_offset_x_;
++        c.center_y = cy + output_offset_y_;
++        c.bottom_x = bottom_x + output_offset_x_;
++        c.bottom_y = max_y + output_offset_y_;
++        c.area = area;
++        cones_.push_back(std::move(c));
+     }
+-    std::sort(cones_.begin(), cones_.end(), [](const Cone& a, const Cone& b) { return a.bottom_y > b.bottom_y; });
++    std::sort(cones_.begin(), cones_.end(),
++              [](const Cone& a, const Cone& b) { return a.bottom_y > b.bottom_y; });
+     return cones_;
+ }
+ 
+--- a/perception/cone_detect.h
++++ b/perception/cone_detect.h
+@@ -35,6 +35,7 @@
+     int output_offset_x_ = 0, output_offset_y_ = 0;
+     std::vector<std::vector<cv::Point>> contours_;
+     std::vector<cv::Vec4i> hierarchy_;
++    std::vector<double> contour_areas_; // cached once per contour; capacity reused across frames
+     std::vector<Cone> cones_;
+ };
+ 
+--- a/perception/cone_logic.cpp
++++ b/perception/cone_logic.cpp
+@@ -5,54 +5,74 @@
+ #include <cmath>
+ #include <cstdint>
+ 
+-namespace {
+-struct RowBucket {
+-    std::vector<Cone> cones;
+-    int64_t sum_y = 0;
+-    double mean_y() const { return cones.empty() ? 0.0 : static_cast<double>(sum_y) / cones.size(); }
+-};
+-}
+-
+-std::vector<std::vector<Cone>> group_rows(const std::vector<Cone>& cones, int tolerance) {
+-    if (cones.empty()) return {};
+-    tolerance = std::max(1, tolerance);
+-    std::vector<Cone> sorted = cones;
+-    std::sort(sorted.begin(), sorted.end(), [](const Cone& a, const Cone& b) {
+-        if (a.bottom_y != b.bottom_y) return a.bottom_y > b.bottom_y;
+-        return a.bottom_x < b.bottom_x;
++size_t ConeRowGrouper::group(const std::vector<Cone>& cones, int tolerance) {
++    // Reuse all high-water capacities. Only pointers are sorted/stored on the hot path; Cone
++    // objects (including their std::string member) are not copied during grouping.
++    for (size_t i = 0; i < active_rows_; ++i) {
++        buckets_[i].cones.clear();
++        buckets_[i].sum_y = 0;
++    }
++    active_rows_ = 0;
++    sorted_.clear();
++    if (sorted_.capacity() < cones.size()) sorted_.reserve(cones.size());
++    for (const auto& cone : cones) sorted_.push_back(&cone);
++    std::sort(sorted_.begin(), sorted_.end(), [](const Cone* a, const Cone* b) {
++        if (a->bottom_y != b->bottom_y) return a->bottom_y > b->bottom_y;
++        return a->bottom_x < b->bottom_x;
+     });
+ 
+-    std::vector<RowBucket> buckets;
+-    buckets.reserve(sorted.size());
+-    for (const auto& cone : sorted) {
+-        int best = -1;
++    tolerance = std::max(1, tolerance);
++    for (const Cone* cone_ptr : sorted_) {
++        const Cone& cone = *cone_ptr;
++        size_t best = active_rows_;
+         double best_dist = static_cast<double>(tolerance) + 1.0;
+-        for (size_t i = 0; i < buckets.size(); ++i) {
+-            const double dist = std::abs(static_cast<double>(cone.bottom_y) - buckets[i].mean_y());
++        for (size_t i = 0; i < active_rows_; ++i) {
++            const double dist = std::abs(static_cast<double>(cone.bottom_y) - buckets_[i].mean_y());
+             if (dist <= tolerance && dist < best_dist) {
+-                best = static_cast<int>(i);
++                best = i;
+                 best_dist = dist;
+             }
+         }
+-        if (best < 0) {
+-            RowBucket b;
+-            b.cones.push_back(cone);
+-            b.sum_y = cone.bottom_y;
+-            buckets.push_back(std::move(b));
++        if (best == active_rows_) {
++            if (active_rows_ == buckets_.size()) buckets_.emplace_back();
++            RowBucket& bucket = buckets_[active_rows_++];
++            bucket.cones.clear();
++            bucket.sum_y = 0;
++            bucket.cones.push_back(cone_ptr);
++            bucket.sum_y = cone.bottom_y;
+         } else {
+-            auto& b = buckets[static_cast<size_t>(best)];
+-            b.cones.push_back(cone);
+-            b.sum_y += cone.bottom_y;
++            RowBucket& bucket = buckets_[best];
++            bucket.cones.push_back(cone_ptr);
++            bucket.sum_y += cone.bottom_y;
+         }
+     }
+-    std::sort(buckets.begin(), buckets.end(), [](const RowBucket& a, const RowBucket& b) {
+-        return a.mean_y() > b.mean_y();
+-    });
++
++    std::sort(buckets_.begin(), buckets_.begin() + static_cast<std::ptrdiff_t>(active_rows_),
++              [](const RowBucket& a, const RowBucket& b) { return a.mean_y() > b.mean_y(); });
++    for (size_t i = 0; i < active_rows_; ++i) {
++        auto& row_cones = buckets_[i].cones;
++        std::sort(row_cones.begin(), row_cones.end(),
++                  [](const Cone* a, const Cone* b) { return a->bottom_x < b->bottom_x; });
++    }
++    return active_rows_;
++}
++
++const std::vector<const Cone*>& ConeRowGrouper::row(size_t index) const {
++    static const std::vector<const Cone*> empty_row;
++    return index < active_rows_ ? buckets_[index].cones : empty_row;
++}
++
++std::vector<std::vector<Cone>> group_rows(const std::vector<Cone>& cones, int tolerance) {
++    ConeRowGrouper grouper;
++    grouper.group(cones, tolerance);
+     std::vector<std::vector<Cone>> rows;
+-    rows.reserve(buckets.size());
+-    for (auto& b : buckets) {
+-        std::sort(b.cones.begin(), b.cones.end(), [](const Cone& a, const Cone& c) { return a.bottom_x < c.bottom_x; });
+-        rows.push_back(std::move(b.cones));
++    rows.reserve(grouper.row_count());
++    for (size_t i = 0; i < grouper.row_count(); ++i) {
++        const auto& source = grouper.row(i);
++        std::vector<Cone> row;
++        row.reserve(source.size());
++        for (const Cone* cone : source) row.push_back(*cone);
++        rows.push_back(std::move(row));
+     }
+     return rows;
+ }
+@@ -60,11 +80,14 @@
+ bool corridor_has_red_blocker(const std::vector<Cone>& red_cones,
+                               int left_x, int right_x, int row_y,
+                               int margin_x, int below_tol) {
+-    const int x_lo = left_x - std::max(0, margin_x);
+-    const int x_hi = right_x + std::max(0, margin_x);
+-    const int y_limit = row_y + std::max(0, below_tol);
++    const int64_t margin = std::max<int64_t>(0, margin_x);
++    const int64_t x_lo = static_cast<int64_t>(left_x) - margin;
++    const int64_t x_hi = static_cast<int64_t>(right_x) + margin;
++    const int64_t y_limit = static_cast<int64_t>(row_y) + std::max<int64_t>(0, below_tol);
+     for (const auto& red : red_cones) {
+-        if (red.bottom_x >= x_lo && red.bottom_x <= x_hi && red.bottom_y <= y_limit) return true;
++        if (static_cast<int64_t>(red.bottom_x) >= x_lo &&
++            static_cast<int64_t>(red.bottom_x) <= x_hi &&
++            static_cast<int64_t>(red.bottom_y) <= y_limit) return true;
+     }
+     return false;
+ }
+@@ -74,12 +97,15 @@
+                                int margin_x, int below_tol) {
+     std::vector<Cone> blockers;
+     if (red_cones.empty()) return blockers;
+-    const int x_lo = left_x - std::max(0, margin_x);
+-    const int x_hi = right_x + std::max(0, margin_x);
+-    const int y_limit = row_y + std::max(0, below_tol);
++    const int64_t margin = std::max<int64_t>(0, margin_x);
++    const int64_t x_lo = static_cast<int64_t>(left_x) - margin;
++    const int64_t x_hi = static_cast<int64_t>(right_x) + margin;
++    const int64_t y_limit = static_cast<int64_t>(row_y) + std::max<int64_t>(0, below_tol);
+     blockers.reserve(red_cones.size());
+     for (const auto& red : red_cones) {
+-        if (red.bottom_x >= x_lo && red.bottom_x <= x_hi && red.bottom_y <= y_limit) blockers.push_back(red);
++        if (static_cast<int64_t>(red.bottom_x) >= x_lo &&
++            static_cast<int64_t>(red.bottom_x) <= x_hi &&
++            static_cast<int64_t>(red.bottom_y) <= y_limit) blockers.push_back(red);
+     }
+     return blockers;
+ }
+@@ -92,9 +118,13 @@
+     } else if (policy == "right") {
+         for (const auto& g : gaps) if (g.center_x > best->center_x) best = &g;
+     } else {
+-        int best_dist = std::abs(best->center_x - image_center_x);
++        const auto distance = [](int a, int b) -> int64_t {
++            const int64_t d = static_cast<int64_t>(a) - static_cast<int64_t>(b);
++            return d < 0 ? -d : d;
++        };
++        int64_t best_dist = distance(best->center_x, image_center_x);
+         for (const auto& g : gaps) {
+-            const int d = std::abs(g.center_x - image_center_x);
++            const int64_t d = distance(g.center_x, image_center_x);
+             if (d < best_dist || (d == best_dist && g.width > best->width)) {
+                 best = &g;
+                 best_dist = d;
+--- a/perception/cone_logic.h
++++ b/perception/cone_logic.h
+@@ -11,11 +11,34 @@
+ 
+ #include "cone.h"
+ #include <vector>
++#include <cstddef>
++#include <cstdint>
+ #include <string>
+ 
+ /* 按 bottom_y 把锥桶归成"排"（同一排 y 接近，容差 tolerance）；排按远近(mean_y)降序返回 */
+ std::vector<std::vector<Cone>> group_rows(const std::vector<Cone>& cones, int tolerance);
+ 
++
++/* Reusable row grouper for the per-frame control path. It stores pointers into the input cone
++ * vector and reuses bucket capacity; input must remain unchanged until the next group() call. */
++class ConeRowGrouper {
++public:
++    size_t group(const std::vector<Cone>& cones, int tolerance);
++    size_t row_count() const { return active_rows_; }
++    const std::vector<const Cone*>& row(size_t index) const;
++private:
++    struct RowBucket {
++        std::vector<const Cone*> cones;
++        int64_t sum_y = 0;
++        double mean_y() const {
++            return cones.empty() ? 0.0 : static_cast<double>(sum_y) / static_cast<double>(cones.size());
++        }
++    };
++    std::vector<const Cone*> sorted_;
++    std::vector<RowBucket> buckets_;
++    size_t active_rows_ = 0;
++};
++
+ /* 判定间隙 [left_x, right_x]（行 ry）内是否有红锥阻挡；below_tol = 比选中排更靠后的容忍像素 */
+ bool corridor_has_red_blocker(const std::vector<Cone>& red_cones,
+                               int left_x, int right_x, int row_y,
+--- a/perception/vision_pipeline.cpp
++++ b/perception/vision_pipeline.cpp
+@@ -4,14 +4,17 @@
+ 
+ void VisionPipeline::configure(const VisionPipelineParams& params) {
+     p_ = params;
+-    int k = std::max(1, p_.morphology_kernel_size);
++    // Keep the kernel bounded even when the class is used without Config::validate().
++    int k = std::clamp(p_.morphology_kernel_size, 1, 31);
+     if ((k % 2) == 0) ++k;
++    p_.morphology_iterations = std::clamp(p_.morphology_iterations, 0, 5);
++    p_.dark_threshold_v = std::clamp(p_.dark_threshold_v, 0, 255);
+     kernel_ = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k));
+     configured_ = true;
+ }
+ 
+ bool VisionPipeline::process(const cv::Mat& bgr, bool clean_masks) {
+-    if (!configured_ || bgr.empty() || bgr.channels() != 3) return false;
++    if (!configured_ || bgr.empty() || bgr.channels() != 3 || bgr.depth() != CV_8U) return false;
+     cv::cvtColor(bgr, hsv_, cv::COLOR_BGR2HSV);
+     cv::inRange(hsv_, cv::Scalar(p_.colors.blue.h_low, p_.colors.blue.s_low, p_.colors.blue.v_low),
+                 cv::Scalar(p_.colors.blue.h_high, 255, 255), blue_mask_);
+--- a/run_tests.sh
++++ b/run_tests.sh
+@@ -41,7 +41,7 @@
+   app/main.cpp app/mission_controller.cpp config/config.cpp hal/hal_linux.cpp hal/voice_cmd.cpp \
+   decision/event_log.cpp decision/state_machine.cpp perception/color_detect.cpp perception/cone_detect.cpp \
+   perception/camp_detect.cpp perception/cone_logic.cpp perception/vision_pipeline.cpp \
+-  control/steering.cpp control/drive_controller.cpp tests/vision_synthetic.cpp
++  control/steering.cpp control/drive_controller.cpp tests/vision_synthetic.cpp tests/vision_benchmark.cpp
+ if command -v gcc >/dev/null 2>&1; then gcc -std=gnu11 -Wall -Wextra -Wpedantic -fsyntax-only -Idrivers drivers/pid.c drivers/pca9685.c drivers/imu.c; fi
+ 
+ echo ""
+--- a/tests/stub/opencv2/opencv.hpp
++++ b/tests/stub/opencv2/opencv.hpp
+@@ -30,14 +30,17 @@
+ public:
+     int rows = 0, cols = 0;
+     Mat() = default;
+-    Mat(int r, int c, int) : rows(r), cols(c) {}
+-    Mat(int r, int c, int, const Scalar&) : rows(r), cols(c) {}
++    Mat(int r, int c, int type) : rows(r), cols(c), channels_(type == 16 ? 3 : 1) {}
++    Mat(int r, int c, int type, const Scalar&) : rows(r), cols(c), channels_(type == 16 ? 3 : 1) {}
+     bool empty() const { return rows <= 0 || cols <= 0; }
+-    int channels() const { return 3; }
+-    void release() { rows = cols = 0; }
++    int channels() const { return channels_; }
++    int depth() const { return 0; }
++    void release() { rows = cols = 0; channels_ = 1; }
+     template<class T> T* ptr(int) { return nullptr; }
+     template<class T> const T* ptr(int) const { return nullptr; }
+-    Mat operator()(const Rect& r) const { return Mat(r.height, r.width, 0); }
++    Mat operator()(const Rect& r) const { return Mat(r.height, r.width, channels_ == 3 ? 16 : 0); }
++private:
++    int channels_ = 1;
+ };
+ class VideoCapture {
+ public:
+@@ -51,8 +54,9 @@
+ };
+ constexpr int CAP_V4L2 = 0, CAP_PROP_FRAME_WIDTH = 1, CAP_PROP_FRAME_HEIGHT = 2,
+               CAP_PROP_FPS = 3, CAP_PROP_BUFFERSIZE = 4;
++constexpr int CV_8U = 0;
+ constexpr int COLOR_BGR2HSV = 1, MORPH_ELLIPSE = 2, MORPH_OPEN = 3, MORPH_CLOSE = 4,
+-              RETR_EXTERNAL = 5, CHAIN_APPROX_SIMPLE = 6, INTER_AREA = 7;
++              RETR_EXTERNAL = 5, CHAIN_APPROX_SIMPLE = 6, INTER_AREA = 7, INTER_LINEAR = 8;
+ inline void resize(const Mat& src, Mat& dst, const Size& size, double = 0.0, double = 0.0, int = INTER_AREA) { dst = Mat(size.height, size.width, 0); (void)src; }
+ inline void cvtColor(const Mat&, Mat&, int) {}
+ inline void inRange(const Mat&, const Scalar&, const Scalar&, Mat&) {}
+@@ -67,5 +71,7 @@
+ inline Moments moments(const std::vector<Point>&) { return Moments(); }
+ inline void fillConvexPoly(Mat&, const std::vector<Point>&, const Scalar&) {}
+ }
++#define CV_8U 0
++#define CV_8UC1 0
+ #define CV_8UC3 16
+ #endif
+--- a/tests/test_cone_logic.cpp
++++ b/tests/test_cone_logic.cpp
+@@ -7,6 +7,11 @@
+ #include "cone_logic.h"
+ 
+ #include <cstdio>
++#include <climits>
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <random>
+ 
+ static int g_pass = 0, g_fail = 0;
+ #define CHECK(cond, msg) do { \
+@@ -46,6 +51,97 @@
+     CHECK(!corridor_has_red_blocker(reds, 100, 150, 200, 10, 40), "无分配阻挡判定为 false");
+ }
+ 
++
++static void test_reusable_grouper_and_extremes() {
++    ConeRowGrouper grouper;
++    std::vector<Cone> cones = {mk(300, 100), mk(100, 50), mk(105, 60)};
++    CHECK(grouper.group(cones, 35) == 2, "复用分行器输出 2 排");
++    CHECK(grouper.row(0).size() == 1 && grouper.row(0)[0]->bottom_y == 300,
++          "复用分行器近排在前");
++    CHECK(grouper.row(1).size() == 2 && grouper.row(1)[0]->bottom_x == 50,
++          "复用分行器排内按 x 排序");
++
++    std::vector<Cone> one = {mk(10, 20)};
++    CHECK(grouper.group(one, 35) == 1, "复用分行器支持行数减少");
++    CHECK(grouper.row(0).size() == 1 && grouper.row(1).empty(),
++          "复用分行器不暴露上一帧的过期行");
++    std::vector<Cone> none;
++    CHECK(grouper.group(none, 35) == 0 && grouper.row(0).empty(),
++          "复用分行器支持空输入");
++
++    std::vector<Cone> edge = {mk(INT_MAX, INT_MAX)};
++    CHECK(corridor_has_red_blocker(edge, INT_MAX - 2, INT_MAX, INT_MAX, 10, 10),
++          "极大坐标下阻挡边界不发生有符号溢出");
++    CHECK(red_blockers(edge, INT_MAX - 2, INT_MAX, INT_MAX, 10, 10).size() == 1,
++          "极大坐标下阻挡列表边界正确");
++    std::vector<Gap> extremes = {{INT_MIN, 10}, {INT_MAX, 20}};
++    CHECK(choose_gap_center(extremes, 0, "center") == INT_MAX,
++          "极端中心距离使用 64 位运算");
++}
++
++
++static std::vector<std::vector<Cone>> reference_group_rows(const std::vector<Cone>& cones, int tolerance) {
++    if (cones.empty()) return {};
++    struct Bucket { std::vector<Cone> cones; int64_t sum_y = 0; double mean_y() const {
++        return cones.empty() ? 0.0 : static_cast<double>(sum_y) / static_cast<double>(cones.size());
++    }};
++    std::vector<Cone> sorted = cones;
++    std::sort(sorted.begin(), sorted.end(), [](const Cone& a, const Cone& b) {
++        if (a.bottom_y != b.bottom_y) return a.bottom_y > b.bottom_y;
++        return a.bottom_x < b.bottom_x;
++    });
++    std::vector<Bucket> buckets;
++    tolerance = std::max(1, tolerance);
++    for (const auto& cone : sorted) {
++        int best = -1;
++        double best_dist = static_cast<double>(tolerance) + 1.0;
++        for (size_t i = 0; i < buckets.size(); ++i) {
++            const double dist = std::abs(static_cast<double>(cone.bottom_y) - buckets[i].mean_y());
++            if (dist <= tolerance && dist < best_dist) { best = static_cast<int>(i); best_dist = dist; }
++        }
++        if (best < 0) {
++            Bucket b; b.cones.push_back(cone); b.sum_y = cone.bottom_y; buckets.push_back(std::move(b));
++        } else {
++            buckets[static_cast<size_t>(best)].cones.push_back(cone);
++            buckets[static_cast<size_t>(best)].sum_y += cone.bottom_y;
++        }
++    }
++    std::sort(buckets.begin(), buckets.end(), [](const Bucket& a, const Bucket& b) { return a.mean_y() > b.mean_y(); });
++    std::vector<std::vector<Cone>> rows;
++    rows.reserve(buckets.size());
++    for (auto& b : buckets) {
++        std::sort(b.cones.begin(), b.cones.end(), [](const Cone& a, const Cone& b) { return a.bottom_x < b.bottom_x; });
++        rows.push_back(std::move(b.cones));
++    }
++    return rows;
++}
++
++static void test_grouping_matches_reference() {
++    std::mt19937 rng(0xC0FFEEu);
++    std::uniform_int_distribution<int> count_dist(0, 30);
++    std::uniform_int_distribution<int> x_dist(0, 1279);
++    std::uniform_int_distribution<int> y_dist(0, 719);
++    std::uniform_int_distribution<int> tol_dist(-5, 80);
++    for (int trial = 0; trial < 100; ++trial) {
++        std::vector<Cone> cones;
++        const int count = count_dist(rng);
++        cones.reserve(static_cast<size_t>(count));
++        for (int i = 0; i < count; ++i) cones.push_back(mk(y_dist(rng), x_dist(rng)));
++        const int tolerance = tol_dist(rng);
++        const auto expected = reference_group_rows(cones, tolerance);
++        const auto actual = group_rows(cones, tolerance);
++        bool same = actual.size() == expected.size();
++        for (size_t r = 0; same && r < expected.size(); ++r) {
++            same = actual[r].size() == expected[r].size();
++            for (size_t c = 0; same && c < expected[r].size(); ++c) {
++                same = actual[r][c].bottom_x == expected[r][c].bottom_x &&
++                       actual[r][c].bottom_y == expected[r][c].bottom_y;
++            }
++        }
++        CHECK(same, "复用分行器与原分组语义一致（确定性随机样本）");
++    }
++}
++
+ static void test_choose_gap() {
+     std::vector<Gap> gaps = { {100, 50}, {300, 60}, {250, 40} };
+ 
+@@ -61,6 +157,8 @@
+     test_group_rows();
+     test_red_blockers();
+     test_choose_gap();
++    test_reusable_grouper_and_extremes();
++    test_grouping_matches_reference();
+ 
+     std::printf("锥桶逻辑测试结果: %d 通过, %d 失败\n", g_pass, g_fail);
+     return g_fail == 0 ? 0 : 1;
+--- a/tests/test_config.cpp
++++ b/tests/test_config.cpp
+@@ -86,6 +86,22 @@
+         CHECK(c.kp == 0.0f, "加载失败不破坏已设值");
+     }
+ 
++
++    /* 6. Reject invalid hue bands and the red-range overlap that could double-count pixels. */
++    {
++        Config c;
++        c.red1.h_high = 175;
++        c.red2.h_low = 170;
++        CHECK(!c.validate(), "重叠的红色 H 区间被拒绝");
++        c = Config{};
++        c.blue.h_low = 140;
++        c.blue.h_high = 120;
++        CHECK(!c.validate(), "反向的蓝色 H 区间被拒绝");
++        c = Config{};
++        c.station_stay_ms = 2999;
++        CHECK(!c.validate(), "直接构造的配置也不能将据点停留降到 3 秒以下");
++    }
++
+     std::printf("config 测试结果: %d 通过, %d 失败\n", g_pass, g_fail);
+     return g_fail == 0 ? 0 : 1;
+ }
+--- a/tests/vision_benchmark.cpp
++++ b/tests/vision_benchmark.cpp
+@@ -0,0 +1,128 @@
++#include "../config/config.h"
++#include "../perception/vision_pipeline.h"
++#include "../perception/cone_detect.h"
++#include "../perception/cone_logic.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <numeric>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++namespace {
++VisionPipelineParams make_vision_params(const Config& c) {
++    VisionPipelineParams p;
++    p.colors.blue = c.blue;
++    p.colors.red1 = c.red1;
++    p.colors.red2 = c.red2;
++    p.morphology_kernel_size = c.morphology_kernel_size;
++    p.morphology_iterations = c.morphology_iterations;
++    p.dark_threshold_v = c.dark_threshold_v;
++    return p;
++}
++
++ConeDetectParams make_cone_params(const Config& c, bool suppress_large_blob) {
++    ConeDetectParams p;
++    p.min_cont_w = c.min_cont_w;
++    p.min_cont_h = c.min_cont_h;
++    p.aspect_min = c.aspect_min;
++    p.aspect_max = c.aspect_max;
++    p.fill_min = c.fill_min;
++    p.fill_max = c.fill_max;
++    p.stop_area_ratio = c.stop_area_ratio;
++    p.suppress_large_blob = suppress_large_blob;
++    p.roi_x1 = c.roi_x1;
++    p.roi_y1 = c.roi_y1;
++    p.roi_w = c.roi_w();
++    p.roi_h = c.roi_h();
++    p.top_exclude_global_y = c.top_exclude_global_y;
++    p.edge_margin_px = c.cone_edge_margin_px;
++    p.shape_min_height = c.cone_shape_min_height;
++    p.bottom_band_min_px = c.cone_bottom_band_min_px;
++    p.bottom_band_max_px = c.cone_bottom_band_max_px;
++    p.bottom_band_height_divisor = c.cone_bottom_band_height_divisor;
++    p.bottom_min_width = c.cone_bottom_min_width;
++    p.mid_min_width = c.cone_mid_min_width;
++    p.bottom_width_ratio = c.cone_bottom_width_ratio;
++    p.mid_width_ratio = c.cone_mid_width_ratio;
++    return p;
++}
++
++void draw_trapezoid(cv::Mat& frame, int cx, int top_y, int bottom_y, int top_w, int bottom_w,
++                    const cv::Scalar& color) {
++    const std::vector<cv::Point> points = {
++        {cx - top_w / 2, top_y}, {cx + top_w / 2, top_y},
++        {cx + bottom_w / 2, bottom_y}, {cx - bottom_w / 2, bottom_y}
++    };
++    cv::fillConvexPoly(frame, points, color);
++}
++}
++
++int main(int argc, char** argv) {
++    const std::string config_path = argc > 1 ? argv[1] : "config/config.ini";
++    Config cfg;
++    if (!cfg.load(config_path)) {
++        std::fprintf(stderr, "cannot load config: %s\n", config_path.c_str());
++        return 2;
++    }
++
++    cv::Mat frame(cfg.cam_h, cfg.cam_w, CV_8UC3, cv::Scalar(100, 100, 100));
++    // Deterministic synthetic workload. This measures code throughput only, not real-world
++    // recognition accuracy or a field-camera latency guarantee.
++    const int y0 = cfg.roi_y1 + cfg.roi_h() / 3;
++    const int y1 = std::min(cfg.cam_h - 2, cfg.roi_y2 - 2);
++    const int x1 = cfg.roi_x1 + cfg.roi_w() / 4;
++    const int x2 = cfg.roi_x1 + cfg.roi_w() / 2;
++    const int x3 = cfg.roi_x1 + (cfg.roi_w() * 3) / 4;
++    draw_trapezoid(frame, x1, y0, y1, 20, 56, cv::Scalar(255, 0, 0));
++    draw_trapezoid(frame, x2, y0, y1, 20, 56, cv::Scalar(255, 0, 0));
++    draw_trapezoid(frame, x3, y0, y1, 20, 56, cv::Scalar(255, 0, 0));
++    draw_trapezoid(frame, cfg.roi_x1 + cfg.roi_w() / 3, y0 + 10, y1 - 20, 18, 50,
++                   cv::Scalar(0, 0, 255));
++
++    VisionPipeline vision;
++    vision.configure(make_vision_params(cfg));
++    ConeDetector blue_detector(make_cone_params(cfg, true));
++    ConeDetector red_detector(make_cone_params(cfg, false));
++    blue_detector.set_output_offset(cfg.roi_x1, cfg.roi_y1);
++    red_detector.set_output_offset(cfg.roi_x1, cfg.roi_y1);
++    ConeRowGrouper row_grouper;
++    const cv::Rect roi_rect(cfg.roi_x1, cfg.roi_y1, cfg.roi_w(), cfg.roi_h());
++
++    constexpr int kWarmupFrames = 300;
++    constexpr int kMeasuredFrames = 3000;
++    for (int i = 0; i < kWarmupFrames; ++i) {
++        if (!vision.process(frame, true)) return 3;
++        const cv::Mat blue_roi = vision.blue_mask()(roi_rect);
++        const cv::Mat red_roi = vision.red_mask()(roi_rect);
++        const auto& blues = blue_detector.detect(blue_roi, "blue", cfg.min_area_blue);
++        (void)red_detector.detect(red_roi, "red", cfg.min_area_red);
++        (void)row_grouper.group(blues, cfg.row_tolerance);
++    }
++
++    std::vector<double> us;
++    us.reserve(kMeasuredFrames);
++    for (int i = 0; i < kMeasuredFrames; ++i) {
++        const auto begin = std::chrono::steady_clock::now();
++        if (!vision.process(frame, true)) return 3;
++        const cv::Mat blue_roi = vision.blue_mask()(roi_rect);
++        const cv::Mat red_roi = vision.red_mask()(roi_rect);
++        const auto& blues = blue_detector.detect(blue_roi, "blue", cfg.min_area_blue);
++        (void)red_detector.detect(red_roi, "red", cfg.min_area_red);
++        (void)row_grouper.group(blues, cfg.row_tolerance);
++        const auto end = std::chrono::steady_clock::now();
++        us.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
++    }
++
++    const double total = std::accumulate(us.begin(), us.end(), 0.0);
++    std::sort(us.begin(), us.end());
++    const size_t p95_index = (us.size() - 1) * 95 / 100;
++    std::printf("Synthetic vision benchmark (%dx%d, %d measured frames)\n", cfg.cam_w, cfg.cam_h, kMeasuredFrames);
++    std::printf("mean=%.1f us, p50=%.1f us, p95=%.1f us, max=%.1f us\n",
++                total / static_cast<double>(kMeasuredFrames), us[us.size() / 2],
++                us[p95_index], us.back());
++    std::puts("NOTE: synthetic workload only; compare builds on the same target, compiler flags, camera profile and thermal state.");
++    return 0;
++}
+--- a/tests/vision_synthetic.cpp
++++ b/tests/vision_synthetic.cpp
+@@ -22,6 +22,13 @@
+     VisionPipeline vision;
+     vision.configure(make_params(cfg));
+ 
++    cv::Mat invalid_gray(480, 640, CV_8UC1, cv::Scalar(0));
++    CHECK(!vision.process(invalid_gray, false), "reject non-BGR input without calling cvtColor");
++    cv::Mat invalid_color_mask(100, 100, CV_8UC3, cv::Scalar(0, 0, 0));
++    ConeDetector guard_detector;
++    CHECK(guard_detector.detect(invalid_color_mask, "red", 1.0f).empty(),
++          "reject multi-channel mask before findContours");
++
+     cv::Mat blue_card(480, 640, CV_8UC3, cv::Scalar(255, 0, 0));
+     CHECK(vision.process(blue_card, false), "blue card frame processes");
+     CHECK(vision.blue_ratio() >= 0.95f, "blue card ratio high");

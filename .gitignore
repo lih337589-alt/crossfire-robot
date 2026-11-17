@@ -1,0 +1,8 @@
+build/
+demo_new
+logs/*.csv
+
+# macOS / 打包残留
+.DS_Store
+__MACOSX/
+
